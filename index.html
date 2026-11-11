@@ -1,0 +1,399 @@
+
+import os
+import re
+import json
+import time
+import logging
+from datetime import datetime, timezone
+
+import requests
+import firebase_admin
+from firebase_admin import credentials, db
+
+# ---------------- CONFIG ----------------
+
+API_URL = (
+    "https://draw.ar-lottery01.com/WinGo/"
+    "WinGo_30S/GetHistoryIssuePage.json"
+)
+
+DATABASE_URL = os.environ.get(
+    "FIREBASE_DATABASE_URL",
+    "https://maruf-vip-ai-default-rtdb.firebaseio.com"
+)
+
+POLL_SECONDS = 30
+HISTORY_PATH = "wingoRawHistory"
+STATS_PATH = "wingoPatternStats"
+STATUS_PATH = "wingoCollectorStatus"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://draw.ar-lottery01.com/"
+})
+
+
+# ---------------- FIREBASE ----------------
+
+def connect_firebase():
+    if firebase_admin._apps:
+        return
+
+    service_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+    if not service_json:
+        raise RuntimeError(
+            "FIREBASE_SERVICE_ACCOUNT_JSON environment variable is missing."
+        )
+
+    try:
+        service_account = json.loads(service_json)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Firebase service account JSON is invalid."
+        ) from exc
+
+    credential = credentials.Certificate(service_account)
+
+    firebase_admin.initialize_app(
+        credential,
+        {"databaseURL": DATABASE_URL}
+    )
+
+
+# ---------------- API DATA PARSER ----------------
+
+ISSUE_KEYS = (
+    "issueNumber", "issue", "period", "periodNumber",
+    "issue_no", "round", "drawId"
+)
+
+NUMBER_KEYS = (
+    "number", "openNumber", "result", "winningNumber",
+    "openCode", "lotteryNumber"
+)
+
+
+def find_value(obj, keys):
+    """Find a matching field inside a nested dictionary."""
+    if isinstance(obj, dict):
+        for key in keys:
+            if key in obj and obj[key] is not None:
+                return obj[key]
+
+        for value in obj.values():
+            found = find_value(value, keys)
+            if found is not None:
+                return found
+
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_value(value, keys)
+            if found is not None:
+                return found
+
+    return None
+
+
+def collect_candidate_records(obj, found=None):
+    """Collect dictionaries that appear to contain issue and result fields."""
+    if found is None:
+        found = []
+
+    if isinstance(obj, dict):
+        issue = find_value(obj, ISSUE_KEYS)
+        number = find_value(obj, NUMBER_KEYS)
+
+        if issue is not None and number is not None:
+            found.append((str(issue), str(number)))
+
+        for value in obj.values():
+            collect_candidate_records(value, found)
+
+    elif isinstance(obj, list):
+        for value in obj:
+            collect_candidate_records(value, found)
+
+    return found
+
+
+def normalize_number(raw):
+    """
+    Convert a result to a single digit.
+    Supports values such as 7, '7', '07', or '7,2,9'.
+    """
+    text = str(raw).strip()
+
+    if not text:
+        return None
+
+    # A comma-separated result may contain the winning digit first.
+    if "," in text:
+        text = text.split(",")[0].strip()
+
+    match = re.fullmatch(r"\d+", text)
+
+    if not match:
+        return None
+
+    value = int(text)
+
+    if 0 <= value <= 9:
+        return value
+
+    # Some APIs return a two-digit formatted value.
+    if len(text) == 2 and text.startswith("0"):
+        return int(text[-1])
+
+    return None
+
+
+def fetch_draws():
+    response = session.get(API_URL, timeout=20)
+    response.raise_for_status()
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "API response is not valid JSON."
+        ) from exc
+
+    candidates = collect_candidate_records(payload)
+
+    unique = {}
+
+    for issue, raw_number in candidates:
+        number = normalize_number(raw_number)
+
+        if number is None:
+            continue
+
+        issue = issue.strip()
+
+        if issue:
+            unique[issue] = {
+                "issue": issue,
+                "number": number,
+                "bigSmall": "BIG" if number >= 5 else "SMALL"
+            }
+
+    if not unique:
+        preview = json.dumps(payload, ensure_ascii=False)[:1200]
+        raise RuntimeError(
+            "Could not identify issue/result fields in API response. "
+            "Response preview: " + preview
+        )
+
+    return list(unique.values())
+
+
+# ---------------- HISTORY ----------------
+
+def issue_sort_key(draw):
+    issue = str(draw["issue"])
+    digits = re.sub(r"\D", "", issue)
+
+    if digits:
+        return (0, int(digits), issue)
+
+    return (1, issue, issue)
+
+
+def load_history():
+    data = db.reference(HISTORY_PATH).get() or {}
+
+    draws = []
+
+    if isinstance(data, dict):
+        for key, item in data.items():
+            if not isinstance(item, dict):
+                continue
+
+            number = normalize_number(item.get("number"))
+
+            if number is None:
+                continue
+
+            issue = str(item.get("issue", key))
+
+            draws.append({
+                "issue": issue,
+                "number": number,
+                "bigSmall": (
+                    "BIG" if number >= 5 else "SMALL"
+                )
+            })
+
+    return sorted(draws, key=issue_sort_key)
+
+
+def safe_firebase_key(value):
+    return re.sub(r"[.#$/\[\]]", "_", str(value))
+
+
+def save_draws(new_draws):
+    history_ref = db.reference(HISTORY_PATH)
+    added = 0
+
+    for draw in new_draws:
+        key = safe_firebase_key(draw["issue"])
+
+        existing = history_ref.child(key).get()
+
+        if existing is not None:
+            continue
+
+        record = {
+            **draw,
+            "savedAt": datetime.now(timezone.utc).isoformat()
+        }
+
+        history_ref.child(key).set(record)
+        added += 1
+
+    return added
+
+
+# ---------------- PATTERN STATISTICS ----------------
+
+def calculate_statistics(draws):
+    """
+    Pattern = previous draw's last digit + current draw's last digit.
+
+    The category counted for that pattern is the NEXT draw.
+    The latest pair is not counted until its next draw exists.
+    """
+    stats = {}
+
+    for first_digit in range(10):
+        for second_digit in range(10):
+            pattern = f"{first_digit}{second_digit}"
+
+            stats[pattern] = {
+                "pattern": pattern,
+                "total": 0,
+                "big": 0,
+                "small": 0,
+                "bigPercent": 0.0,
+                "smallPercent": 0.0
+            }
+
+    for index in range(len(draws) - 2):
+        previous_number = draws[index]["number"]
+        current_number = draws[index + 1]["number"]
+        next_category = draws[index + 2]["bigSmall"]
+
+        pattern = (
+            f"{previous_number % 10}"
+            f"{current_number % 10}"
+        )
+
+        item = stats[pattern]
+        item["total"] += 1
+
+        if next_category == "BIG":
+            item["big"] += 1
+        else:
+            item["small"] += 1
+
+    for item in stats.values():
+        total = item["total"]
+
+        if total:
+            item["bigPercent"] = round(
+                item["big"] * 100 / total, 2
+            )
+            item["smallPercent"] = round(
+                item["small"] * 100 / total, 2
+            )
+
+        item["status"] = "DATA" if total else "NO_DATA"
+
+    return stats
+
+
+# ---------------- STATUS ----------------
+
+def update_status(message, ok=True, **extra):
+    data = {
+        "message": message,
+        "ok": ok,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+        **extra
+    }
+
+    db.reference(STATUS_PATH).set(data)
+
+
+# ---------------- MAIN LOOP ----------------
+
+def run_once():
+    api_draws = fetch_draws()
+    added = save_draws(api_draws)
+
+    all_draws = load_history()
+
+    if len(all_draws) < 3:
+        update_status(
+            "Waiting for at least 3 real draws.",
+            True,
+            historyCount=len(all_draws),
+            added=added
+        )
+        return
+
+    statistics = calculate_statistics(all_draws)
+
+    db.reference(STATS_PATH).set(statistics)
+
+    update_status(
+        "Collector running successfully.",
+        True,
+        historyCount=len(all_draws),
+        patternsCalculated=100,
+        added=added
+    )
+
+    logging.info(
+        "History: %s | New draws: %s | Patterns: 100",
+        len(all_draws),
+        added
+    )
+
+
+def main():
+    connect_firebase()
+
+    logging.info("WinGo 30S collector started.")
+
+    while True:
+        started = time.time()
+
+        try:
+            run_once()
+
+        except Exception as error:
+            logging.exception("Collector error: %s", error)
+
+            try:
+                update_status(
+                    str(error),
+                    False
+                )
+            except Exception:
+                logging.exception("Could not update Firebase status.")
+
+        elapsed = time.time() - started
+        time.sleep(max(1, POLL_SECONDS - elapsed))
+
+
+if __name__ == "__main__":
+    main()
